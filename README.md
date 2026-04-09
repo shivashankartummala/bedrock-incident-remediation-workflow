@@ -1,52 +1,108 @@
 # Bedrock Incident Remediation Workflow
 
-This repository contains a production-oriented incident-remediation workflow for application latency using AWS Step Functions, Amazon Bedrock model inference, and AWS Lambda.
+Production-ready AWS Step Functions workflow for remediating application latency using Amazon Bedrock, AWS Lambda, Amazon ECS, Amazon CloudWatch, Amazon SNS, and DynamoDB.
 
-## What is included
+![Architecture Diagram](docs/bedrock-incident-managemnt-workflow.png)
 
-- An AWS Step Functions state machine in Amazon States Language
-- A context collection Lambda for CloudWatch logs and metrics
-- A validation Lambda that enforces structured model output with `jsonschema`
-- An execution Lambda that performs ECS remediation with explicit idempotency tracking
-- An AWS SAM template that wires the components together
-- IAM guidance with least-privilege policy suggestions
+<details open>
+<summary><strong>Overview</strong></summary>
 
-## Important design note
+This project orchestrates an automated-but-guardrailed remediation flow for ECS service latency incidents.
 
-The workflow uses the Step Functions optimized Bedrock integration:
+- AWS Step Functions coordinates the workflow
+- Amazon Bedrock provides the remediation reasoning step
+- Lambda functions collect context, validate model output, and execute rollback
+- DynamoDB provides idempotency tracking
+- SNS handles manual escalation when automation should stop
 
-- `arn:aws:states:::bedrock:invokeModel`
+</details>
 
-That is the integration modeled in the state machine. If you later need a strict Amazon Bedrock Agent `InvokeAgent` call, wrap that API in Lambda and swap the `InvokeBedrockAgent` task to a Lambda invocation. The rest of the workflow stays the same.
+<details open>
+<summary><strong>Core Components</strong></summary>
 
-## Deployment
+- `incident_remediation.asl.json`: State machine definition for orchestration, retries, self-correction, and escalation
+- `lambdas/get_context/app.py`: Collects CloudWatch logs and metrics for the incident window
+- `lambdas/validate_agent_output/app.py`: Enforces strict JSON schema validation using `jsonschema`
+- `lambdas/execute_remediation/app.py`: Performs ECS rollback with execution-level idempotency
+- `template.yaml`: AWS SAM deployment template
+- `docs/iam-least-privilege.md`: Least-privilege IAM guidance
 
-1. Update the parameter defaults or provide stack parameters for:
-   - ECS cluster and service names
-   - Bedrock model ID
-   - CloudWatch log group
-   - CloudWatch metric namespace/name
-   - SNS email endpoint
-2. Build and deploy:
+</details>
+
+<details>
+<summary><strong>Execution Flow</strong></summary>
+
+1. `Initialize` sets the self-correction counter.
+2. `GetContext` gathers recent CloudWatch logs and metric data for the impacted ECS service.
+3. `InvokeBedrockAgent` calls Bedrock through the Step Functions optimized integration `arn:aws:states:::bedrock:invokeModel`.
+4. `ValidateResponse` verifies that the model output is valid JSON and contains only approved remediation fields.
+5. `SelfCorrect` re-prompts the model with the validation error if the output is malformed.
+6. `ExecuteAction` performs the ECS rollback only after the response is both valid and safe.
+7. `ManualInterventionNotification` publishes the incident payload to SNS when the workflow fails or proposes an unsafe action.
+
+</details>
+
+<details>
+<summary><strong>Reliability and Safety</strong></summary>
+
+### Idempotency
+
+The remediation Lambda uses the Step Functions execution ID as the stable idempotency key and records progress in DynamoDB before and after the ECS update. This prevents duplicate rollback actions when retries happen around transient failures.
+
+### Circuit Breaker
+
+The self-correction loop is intentionally bounded to two retries. That creates a circuit-breaker pattern for malformed model output so the workflow fails closed and hands off to humans instead of retrying indefinitely.
+
+### Deterministic Guardrails
+
+- Only `ecs_rollback` is allowed
+- Validation rejects malformed or unsupported actions
+- Unsafe or exhausted flows are routed to SNS for human review
+
+</details>
+
+<details>
+<summary><strong>Deployment</strong></summary>
+
+Update the deployment inputs in `template.yaml` or pass them as parameters:
+
+- Bedrock model ID
+- CloudWatch log group name
+- CloudWatch metric namespace and metric name
+- ECS cluster name
+- ECS service name
+- SNS email endpoint for escalation
+
+Build and deploy with AWS SAM:
 
 ```bash
 sam build
 sam deploy --guided
 ```
 
-## State machine behavior
+</details>
 
-1. `GetContext` gathers recent CloudWatch signals.
-2. `InvokeBedrockAgent` sends the incident context to Bedrock using the optimized integration.
-3. `ValidateResponse` checks the model output against a strict schema.
-4. `SelfCorrect` re-prompts the model with the validation error if the output is malformed.
-5. `ExecuteAction` performs a controlled ECS rollback when the action is valid and safe.
-6. Failures or unsafe proposals go to SNS for manual intervention.
+<details>
+<summary><strong>Design Note About Bedrock</strong></summary>
 
-## Idempotency
+This implementation uses the Step Functions optimized Bedrock integration:
 
-The remediation Lambda uses a DynamoDB table keyed by the Step Functions execution ID. That makes the rollback operation safe to retry because the same execution can only record one successful remediation action.
+- `arn:aws:states:::bedrock:invokeModel`
 
-## Circuit breaker
+That is the native service integration modeled in the workflow. If you later decide to use a direct Amazon Bedrock Agent `InvokeAgent` API path, the clean approach is to wrap that call in a Lambda function and replace the Bedrock task while keeping the rest of the state machine unchanged.
 
-The state machine uses a bounded self-correction loop with a maximum of two retries. That acts as a circuit breaker for malformed model output so the workflow fails closed and escalates to humans instead of looping indefinitely.
+</details>
+
+<details>
+<summary><strong>References</strong></summary>
+
+- [Detailed design notes](readme-detailed.md)
+- [Architecture diagram](docs/bedrock-incident-managemnt-workflow.png)
+- [State machine definition](statemachine/incident_remediation.asl.json)
+- [SAM deployment template](template.yaml)
+- [IAM least-privilege guidance](docs/iam-least-privilege.md)
+- [Context collection Lambda](lambdas/get_context/app.py)
+- [Validation Lambda](lambdas/validate_agent_output/app.py)
+- [Remediation Lambda](lambdas/execute_remediation/app.py)
+
+</details>
