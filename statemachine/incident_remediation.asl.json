@@ -1,0 +1,249 @@
+{
+  "Comment": "Resilient incident remediation workflow for application latency. The bounded self-correction loop acts as a circuit breaker so malformed model output escalates after two failed correction attempts instead of looping forever.",
+  "StartAt": "Initialize",
+  "States": {
+    "Initialize": {
+      "Type": "Pass",
+      "Parameters": {
+        "request.$": "$",
+        "self_correction_attempts": 0
+      },
+      "ResultPath": "$",
+      "Next": "GetContext"
+    },
+    "GetContext": {
+      "Type": "Task",
+      "Comment": "Collect recent CloudWatch logs and metrics for the service before asking the model for remediation guidance.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${GetContextFunctionArn}",
+        "Payload": {
+          "log_group_name.$": "$.request.log_group_name",
+          "metric_namespace.$": "$.request.metric_namespace",
+          "metric_name.$": "$.request.metric_name",
+          "ecs_cluster.$": "$.request.ecs_cluster",
+          "ecs_service.$": "$.request.ecs_service",
+          "lookback_minutes.$": "$.request.lookback_minutes"
+        }
+      },
+      "ResultPath": "$.context_result",
+      "OutputPath": "$",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.failure",
+          "Next": "ManualInterventionNotification"
+        }
+      ],
+      "Next": "InvokeBedrockAgent"
+    },
+    "InvokeBedrockAgent": {
+      "Type": "Task",
+      "Comment": "Use the Step Functions optimized Bedrock integration to reason over the incident context and produce a structured remediation proposal.",
+      "Resource": "arn:aws:states:::bedrock:invokeModel",
+      "Parameters": {
+        "ModelId": "${BedrockModelId}",
+        "Body": {
+          "anthropic_version": "bedrock-2023-05-31",
+          "max_tokens": 900,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text.$": "States.Format('You are a production remediation agent for ECS latency incidents. Return JSON only with keys action_type, resource_id, reasoning, and optional target_task_definition. Allowed action_type values: ecs_rollback. Incident context: {}', States.JsonToString($.context_result.Payload))"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultSelector": {
+        "raw_completion.$": "$.Body.content[0].text"
+      },
+      "ResultPath": "$.agent_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Bedrock.ThrottlingException",
+            "Bedrock.InternalServerException"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.failure",
+          "Next": "ManualInterventionNotification"
+        }
+      ],
+      "Next": "ValidateResponse"
+    },
+    "ValidateResponse": {
+      "Type": "Task",
+      "Comment": "Validate the model output before any remediation action is allowed to proceed.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateAgentOutputFunctionArn}",
+        "Payload": {
+          "agent_response.$": "$.agent_result.raw_completion"
+        }
+      },
+      "ResultPath": "$.validation_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.failure",
+          "Next": "ManualInterventionNotification"
+        }
+      ],
+      "Next": "ValidationDecision"
+    },
+    "ValidationDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.validation_result.Payload.is_valid",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.validation_result.Payload.is_safe",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ExecuteAction"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.validation_result.Payload.is_valid",
+              "BooleanEquals": false
+            },
+            {
+              "Variable": "$.self_correction_attempts",
+              "NumericLessThan": 2
+            }
+          ],
+          "Next": "IncrementSelfCorrectionCounter"
+        }
+      ],
+      "Default": "UnsafeOrExhausted"
+    },
+    "IncrementSelfCorrectionCounter": {
+      "Type": "Pass",
+      "Parameters": {
+        "request.$": "$.request",
+        "context_result.$": "$.context_result",
+        "agent_result.$": "$.agent_result",
+        "validation_result.$": "$.validation_result",
+        "self_correction_attempts.$": "States.MathAdd($.self_correction_attempts, 1)"
+      },
+      "ResultPath": "$",
+      "Next": "SelfCorrect"
+    },
+    "SelfCorrect": {
+      "Type": "Task",
+      "Comment": "Re-prompt the model with the validation error. This bounded retry is the workflow's circuit breaker for malformed output.",
+      "Resource": "arn:aws:states:::bedrock:invokeModel",
+      "Parameters": {
+        "ModelId": "${BedrockModelId}",
+        "Body": {
+          "anthropic_version": "bedrock-2023-05-31",
+          "max_tokens": 900,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text.$": "States.Format('Your previous response was rejected. Validation error: {}. Return valid JSON only with keys action_type, resource_id, reasoning, and optional target_task_definition. Allowed action_type values: ecs_rollback. Incident context: {}', $.validation_result.Payload.validation_error, States.JsonToString($.context_result.Payload))"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultSelector": {
+        "raw_completion.$": "$.Body.content[0].text"
+      },
+      "ResultPath": "$.agent_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Bedrock.ThrottlingException",
+            "Bedrock.InternalServerException"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "MaxAttempts": 4
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.failure",
+          "Next": "ManualInterventionNotification"
+        }
+      ],
+      "Next": "ValidateResponse"
+    },
+    "ExecuteAction": {
+      "Type": "Task",
+      "Comment": "Apply the validated remediation. The Lambda enforces idempotency using the Step Functions execution ID to keep retries safe.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ExecuteRemediationFunctionArn}",
+        "Payload": {
+          "remediation_action.$": "$.validation_result.Payload.remediation_action",
+          "ecs_cluster.$": "$.request.ecs_cluster",
+          "ecs_service.$": "$.request.ecs_service",
+          "execution_id.$": "$$.Execution.Id"
+        }
+      },
+      "ResultPath": "$.execution_result",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.failure",
+          "Next": "ManualInterventionNotification"
+        }
+      ],
+      "End": true
+    },
+    "UnsafeOrExhausted": {
+      "Type": "Pass",
+      "Parameters": {
+        "cause": "Agent response was unsafe or self-correction retries were exhausted.",
+        "validation.$": "$.validation_result.Payload",
+        "attempts.$": "$.self_correction_attempts",
+        "request.$": "$.request"
+      },
+      "ResultPath": "$.failure",
+      "Next": "ManualInterventionNotification"
+    },
+    "ManualInterventionNotification": {
+      "Type": "Task",
+      "Comment": "A common failure path that escalates to human responders.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${ManualInterventionTopicArn}",
+        "Subject": "Latency remediation requires manual intervention",
+        "Message.$": "States.JsonToString($)"
+      },
+      "Next": "FailWorkflow"
+    },
+    "FailWorkflow": {
+      "Type": "Fail",
+      "Error": "IncidentRemediationFailed",
+      "Cause": "Automated remediation could not complete safely."
+    }
+  }
+}

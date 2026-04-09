@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Bedrock-driven ECS incident remediation workflow with Step Functions and Lambda.
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 60
+    Tracing: Active
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+  CloudWatchLogGroupName:
+    Type: String
+  CloudWatchMetricNamespace:
+    Type: String
+  CloudWatchMetricName:
+    Type: String
+    Default: TargetResponseTime
+  EcsClusterName:
+    Type: String
+  EcsServiceName:
+    Type: String
+  ManualInterventionEmail:
+    Type: String
+
+Resources:
+  ManualInterventionTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: manual-intervention-topic
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref ManualInterventionEmail
+
+  RemediationIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ExecutionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ExecutionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: TtlEpoch
+        Enabled: true
+
+  GetContextFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/get_context/
+      Handler: app.lambda_handler
+      Description: Fetch CloudWatch logs and metrics for incident context.
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref CloudWatchLogGroupName
+          METRIC_NAMESPACE: !Ref CloudWatchMetricNamespace
+          METRIC_NAME: !Ref CloudWatchMetricName
+          ECS_CLUSTER_NAME: !Ref EcsClusterName
+          ECS_SERVICE_NAME: !Ref EcsServiceName
+      Policies:
+        - Statement:
+            - Sid: ReadCloudWatchSignals
+              Effect: Allow
+              Action:
+                - logs:FilterLogEvents
+                - cloudwatch:GetMetricStatistics
+              Resource: "*"
+
+  ValidateAgentOutputFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/validate_agent_output/
+      Handler: app.lambda_handler
+      Description: Validate Bedrock remediation output against a strict schema.
+
+  ExecuteRemediationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/execute_remediation/
+      Handler: app.lambda_handler
+      Description: Safely execute ECS rollback remediation with external idempotency control.
+      Environment:
+        Variables:
+          ECS_CLUSTER_NAME: !Ref EcsClusterName
+          ECS_SERVICE_NAME: !Ref EcsServiceName
+          IDEMPOTENCY_TABLE_NAME: !Ref RemediationIdempotencyTable
+      Policies:
+        - Statement:
+            - Sid: UpdateSpecificEcsService
+              Effect: Allow
+              Action:
+                - ecs:UpdateService
+                - ecs:DescribeServices
+              Resource:
+                - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${EcsClusterName}/${EcsServiceName}
+                - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${EcsClusterName}
+            - Sid: TrackIdempotency
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt RemediationIdempotencyTable.Arn
+
+  IncidentRemediationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/incident_remediation.asl.json
+      DefinitionSubstitutions:
+        GetContextFunctionArn: !GetAtt GetContextFunction.Arn
+        ValidateAgentOutputFunctionArn: !GetAtt ValidateAgentOutputFunction.Arn
+        ExecuteRemediationFunctionArn: !GetAtt ExecuteRemediationFunction.Arn
+        ManualInterventionTopicArn: !Ref ManualInterventionTopic
+        BedrockModelId: !Ref BedrockModelId
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetContextFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateAgentOutputFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExecuteRemediationFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ManualInterventionTopic.TopicName
+        - Statement:
+            - Sid: InvokeSpecificBedrockModel
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the incident remediation state machine.
+    Value: !Ref IncidentRemediationStateMachine
+  GetContextFunctionArn:
+    Description: ARN of the context collection Lambda.
+    Value: !GetAtt GetContextFunction.Arn
+  ValidateAgentOutputFunctionArn:
+    Description: ARN of the validation Lambda.
+    Value: !GetAtt ValidateAgentOutputFunction.Arn
+  ExecuteRemediationFunctionArn:
+    Description: ARN of the remediation Lambda.
+    Value: !GetAtt ExecuteRemediationFunction.Arn
+  ManualInterventionTopicArn:
+    Description: ARN of the SNS topic used for escalation.
+    Value: !Ref ManualInterventionTopic
