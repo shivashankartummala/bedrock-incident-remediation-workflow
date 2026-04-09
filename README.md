@@ -2,7 +2,7 @@
 
 Production-ready AWS Step Functions workflow for remediating application latency using Amazon Bedrock, AWS Lambda, Amazon ECS, Amazon CloudWatch, Amazon SNS, and DynamoDB.
 
-![Architecture Diagram](docs/bedrock-incident-managemnt-workflow.png)
+![Architecture Diagram](docs/bedrock-incident-management-workflow.png)
 
 <details open>
 <summary><strong>Overview</strong></summary>
@@ -97,7 +97,7 @@ That is the native service integration modeled in the workflow. If you later dec
 <summary><strong>References</strong></summary>
 
 - [Detailed design notes](readme-detailed.md)
-- [Architecture diagram](docs/bedrock-incident-managemnt-workflow.png)
+- [Architecture diagram](docs/bedrock-incident-management-workflow.png)
 - [State machine definition](statemachine/incident_remediation.asl.json)
 - [SAM deployment template](template.yaml)
 - [IAM least-privilege guidance](docs/iam-least-privilege.md)
