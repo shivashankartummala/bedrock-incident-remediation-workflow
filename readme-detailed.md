@@ -1,42 +1,87 @@
-Core Components
-The system is defined by an AWS SAM template and consists of the following primary parts:
+# Detailed Design Notes
 
-Orchestrator (Step Functions): The central state machine (incident_remediation.asl.json) that manages the logic, retries, and failure paths.
+This document expands on the architecture and runtime behavior of the Bedrock incident remediation workflow.
 
-Context Collector (GetContext Lambda): Gathers recent CloudWatch logs and metric statistics (e.g., TargetResponseTime) to provide the AI model with the necessary data to make an informed decision.
+## Core Components
 
-Reasoning Engine (Amazon Bedrock): Uses the optimized invokeModel integration to process the incident context and propose a structured remediation plan.
+The system is defined by an AWS SAM template and is composed of the following building blocks:
 
-Validator (ValidateAgentOutput Lambda): A critical safety component that uses jsonschema to ensure the model's response is valid JSON and contains only allowed actions, such as an ECS rollback.
+- **Orchestrator (AWS Step Functions)**
+  The central state machine in `statemachine/incident_remediation.asl.json` manages control flow, retries, validation routing, and escalation paths.
 
-Executor (ExecuteRemediation Lambda): Performs the actual update_service call in Amazon ECS to roll back to a previous task definition.
+- **Context Collector (`GetContext` Lambda)**
+  The Lambda in `lambdas/get_context/app.py` gathers recent CloudWatch logs and metric statistics, such as `TargetResponseTime`, to provide the model with enough evidence to reason about the incident.
 
-Safety & Escalation: An SNS Topic for manual intervention if the automated system cannot safely resolve the issue, and a DynamoDB Table for idempotency tracking.
+- **Reasoning Engine (Amazon Bedrock)**
+  The workflow uses the optimized `invokeModel` Step Functions integration to process incident context and produce a structured remediation recommendation.
 
-Execution Flow
-The workflow follows a strict sequence of actions to ensure reliability and safety:
+- **Validator (`ValidateAgentOutput` Lambda)**
+  The Lambda in `lambdas/validate_agent_output/app.py` uses `jsonschema` to verify that the model response is valid JSON and contains only approved fields and actions.
 
-Initialize & Context Gathering: The workflow starts by initializing a self-correction counter. The GetContext Lambda then pulls the last 15 minutes of logs and metrics for the affected ECS service.
+- **Executor (`ExecuteRemediation` Lambda)**
+  The Lambda in `lambdas/execute_remediation/app.py` performs the actual ECS remediation by calling `update_service` to roll back the workload to a previous task definition.
 
-AI Analysis (Invoke Bedrock): The gathered context is sent to a Bedrock model (e.g., Claude 3.5 Sonnet). The model is prompted to act as a production remediation agent and must return a JSON response specifying an action_type (restricted to ecs_rollback) and its reasoning.
+- **Safety and Escalation Controls**
+  SNS is used for manual intervention notifications when the workflow cannot proceed safely, and DynamoDB is used to track idempotency for remediation attempts.
 
-Structured Validation: The ValidateResponse state invokes a Lambda that checks the model's output against a strict schema. If the output is malformed or proposes an unsupported action, it is flagged as invalid.
+## Execution Flow
 
-Self-Correction Loop (Circuit Breaker): * If the validation fails, the workflow increments a counter.
+The workflow follows a strict sequence to keep the remediation path safe and deterministic.
 
-If the counter is below two, the SelfCorrect state re-prompts Bedrock, explicitly including the validation error to help the model fix its output.
+### 1. Initialize and Gather Context
 
-If validation fails twice, the workflow triggers the Circuit Breaker logic, escalating to a human via SNS.
+The workflow starts by initializing a self-correction counter. It then invokes the `GetContext` Lambda, which retrieves the last 15 minutes of CloudWatch logs and metrics for the affected ECS service.
 
-Safe Execution: Once an action is validated as both valid and safe, the ExecuteAction Lambda is called. It checks a DynamoDB table to ensure this specific execution ID has not already performed a rollback, providing idempotency even if the Lambda itself is retried.
+### 2. Analyze the Incident with Bedrock
 
-Remediation: The Lambda identifies the previous "ACTIVE" task definition for the ECS service and updates the service to use it, triggering a new deployment.
+The collected context is sent to a Bedrock model, such as Claude 3.5 Sonnet. The prompt instructs the model to behave as a production remediation agent and return JSON only, with an `action_type`, `resource_id`, `reasoning`, and an optional `target_task_definition`.
 
-Escalation Path: Any unhandled errors in the Lambdas or unsafe model proposals lead to the ManualInterventionNotification state, which publishes the full incident context to an SNS topic for engineer review.
+### 3. Validate the Model Output
 
-Resiliency & Security Features
-Idempotency: The system uses the Step Functions execution ID as a hash key in DynamoDB. This prevents accidental duplicate rollbacks if the execution environment encounters a timeout or intermittent failure.
+The `ValidateResponse` state invokes the validation Lambda, which checks the model output against a strict schema. If the payload is malformed or contains an unsupported action, the workflow marks it as invalid.
 
-Least Privilege: IAM roles are narrowly scoped. For example, the ExecuteRemediation Lambda only has permission to describe and update the specific ECS service and cluster defined in the template.
+### 4. Self-Correction Loop
 
-Deterministic Safety: By wrapping the AI's "probabilistic" reasoning inside a deterministic Step Functions state machine, the system ensures it always "fails closed" and escalates to a human rather than taking unpredictable or infinite actions.
+If validation fails, the workflow increments the self-correction counter and re-prompts Bedrock with the validation error.
+
+- If the retry count is still below the configured limit, the `SelfCorrect` state gives the model another chance to return valid JSON.
+- If validation keeps failing after two correction attempts, the workflow trips the circuit breaker behavior and escalates to a human operator through SNS.
+
+### 5. Safe Execution
+
+When the response is both valid and safe, the workflow invokes the `ExecuteAction` Lambda. Before performing the rollback, the Lambda checks DynamoDB to ensure the same Step Functions execution ID has not already triggered the remediation.
+
+### 6. Remediation
+
+The execution Lambda identifies the previous ECS task definition and updates the ECS service to use it, which triggers a new deployment.
+
+### 7. Escalation Path
+
+Any unhandled Lambda exception, Bedrock failure, invalid output exhaustion, or unsafe action proposal is routed to `ManualInterventionNotification`, which publishes the incident payload and failure details to SNS for engineer review.
+
+## Resiliency and Security Features
+
+### Idempotency
+
+The remediation path uses the Step Functions execution ID as the stable idempotency key in DynamoDB. This prevents duplicate rollback actions when Lambda retries happen because of transient failures, timeouts, or partial execution.
+
+### Least Privilege
+
+IAM permissions are narrowly scoped:
+
+- The execution Lambda is limited to describing and updating the intended ECS service and cluster.
+- The validation Lambda does not need AWS API permissions.
+- The Step Functions role is restricted to invoking only the required Lambdas, Bedrock model, and SNS topic.
+
+### Deterministic Safety
+
+The model is allowed to reason probabilistically, but the workflow is not allowed to act probabilistically.
+
+The state machine wraps the model with deterministic controls:
+
+- strict schema validation
+- explicit allowlisting of remediation actions
+- a bounded self-correction loop
+- a fail-closed escalation path
+
+That combination ensures the workflow escalates to humans instead of taking open-ended or unsafe actions.
